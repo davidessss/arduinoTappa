@@ -83,6 +83,8 @@ bool premutoGIU = false;
 bool AllarmeSensoreExt = false;
 bool AllarmeSensoreInt = false;
 bool AllarmeTapparella = false;
+bool SensoreExtAttivo = false;
+bool SensoreIntAttivo = false;
 
 // gestione manual hold (tenere premuto)
 bool manualHold = false;
@@ -90,6 +92,7 @@ bool manualDirectionSU = false;
 unsigned long manualHoldStart = 0;
 bool ahtOK = false; // Indica se il sensore è stato inizializzato correttamente
 bool DisplayAcceso = true; // Accende o spegne il display
+bool RiavvioDaBoot = true; // Latch di riavvio: true all'accensione, reset esplicito via coil 5
 
 struct PressTracker {
   bool pressed = false;
@@ -129,8 +132,11 @@ void caricaConfigEEPROM();
 void registraCicloTapparella();
 void registraCicloSeFinecorsa();
 void resetCicliTapparella();
+void resetAllarmi();
+void configuraFontDisplay();
 bool coilStateFromData(uint8_t fc, void* data);
-void aggiornaAllarmeSensore(uint8_t pin, PressTracker& tracker, bool& alarmFlag, const __FlashStringHelper* label);
+void aggiornaAllarmeSensore(uint8_t pin, PressTracker& tracker, bool& activeFlag, bool& alarmFlag, const __FlashStringHelper* label);
+void aggiornaDisplay(bool force);
 
 
 void setup() {
@@ -147,8 +153,6 @@ void setup() {
   pinMode(SENSOREINT, INPUT);
   digitalWrite(ReleSU, LOW);
   digitalWrite(ReleGIU, LOW);
-  Serial.begin(9600);
-  Serial.println(F("Inizializzo"));
   // Carica i parametri persistiti prima di inizializzare lo stack Modbus.
   caricaConfigEEPROM();
   RS485.begin(SERIAL_BAUDRATE);
@@ -168,7 +172,6 @@ void setup() {
             delay(500);
             break;
         } else {
-            Serial.println(F("AHT20 non trovato, ritento..."));
             delay(2000);
             digitalWrite(BEEP, HIGH); // beeppa
             delay(300);
@@ -177,8 +180,7 @@ void setup() {
         }
     }
   oled.begin(&Adafruit128x64, I2C_ADDRESS);
-  oled.setFont(Verdana12);
-  oled.set2X();
+  configuraFontDisplay();
   oled.clear();
   oled.print(F("ModBus "));
   oled.println(SlaveId);
@@ -191,15 +193,7 @@ void setup() {
     PercentualeMemo = 0;
     EEPROM.update(EEPROM_POS_ADDR, (uint8_t)PercentualeMemo);
   }
-  Serial.print(F("Posizione iniziale: "));
-  Serial.println(PercentualeMemo);
-  Serial.print(F("Cicli totali: "));
-  Serial.println(CicliTapparellaTotali);
-  Serial.print(F("tempoTotale(ms): "));
-  Serial.println(tempoTotale);
-  Serial.print(F("SlaveId: "));
-  Serial.println(SlaveId);
-  Serial.println(F("Accensione"));
+  aggiornaDisplay(true);
 }
 
 void loop() {
@@ -210,23 +204,13 @@ void loop() {
 //
   if (millis() - startMillisTemp >= period)  //test whether the period has elapsed
   {
-    if (!ahtOK) {
-      Serial.println(F("Errore: AHT20 non inizializzato."));
-      oled.setCursor(0, 0);
-      oled.println(F("AHT20 NC"));
-    } else {
+    if (ahtOK) {
       Temperature = myAHT20.readTemperature();
       Humidity = myAHT20.readHumidity();
-      oled.setCursor(40,0);
-      oled.print((int)Temperature);
-      oled.println(F(" C"));
-      oled.setCursor(40,20);
-      oled.print((int)Humidity);
-      oled.println(F(" %"));
     }
     startMillisTemp = millis();  //IMPORTANT to save the start time of the current LED state.
-//Serial.println(freeRam());
   }
+  aggiornaDisplay(false);
   // leggere stato pulsanti e gestire release/press
   gestisciPulsante(PulsanteSU, true);
   gestisciPulsante(PulsanteGIU, false);
@@ -251,8 +235,6 @@ void loop() {
       PercentualeMemo = PercentualeTarget;
       salvaPosizioneEEPROM();
       registraCicloSeFinecorsa();
-      Serial.print(F("Arrivato a: "));
-      Serial.println(PercentualeMemo);
     }
   }
 }
@@ -278,14 +260,11 @@ void ControlloCicliTapparella(void) {
     statoPrecedente = statoAttuale;
     contatoreCicli++;
 
-    Serial.print(F("Cambio stato n. "));
-    Serial.println(contatoreCicli);
   }
 
   // Se 3 o più cambi → allarme
   if (contatoreCicli >= 6) {  // 6 cambi equivalgono a 3 cicli completi ON/OFF
     AllarmeTapparella = true;
-    Serial.println(F("Allarme tapparella: troppi cicli"));
   }
 
   // Reset contatore se nessun cambio per troppo tempo (es. 10 s)
@@ -296,8 +275,8 @@ void ControlloCicliTapparella(void) {
 
 
 void Sensore(void) {
-  aggiornaAllarmeSensore(SENSOREEXT, sensoreExtTracker, AllarmeSensoreExt, F("EXT"));
-  aggiornaAllarmeSensore(SENSOREINT, sensoreIntTracker, AllarmeSensoreInt, F("INT"));
+  aggiornaAllarmeSensore(SENSOREEXT, sensoreExtTracker, SensoreExtAttivo, AllarmeSensoreExt, F("EXT"));
+  aggiornaAllarmeSensore(SENSOREINT, sensoreIntTracker, SensoreIntAttivo, AllarmeSensoreInt, F("INT"));
 }
 
 void gestisciPulsante(int pin, bool su) {
@@ -354,7 +333,6 @@ void startManualHold(bool su) {
     digitalWrite(ReleGIU, HIGH);
     digitalWrite(ReleSU, LOW);
   }
-  Serial.println(su ? "Manuale: inizio pressione SU" : "Manuale: inizio pressione GIU");
 }
 
 void stopManualHold() {
@@ -372,8 +350,6 @@ void stopManualHold() {
   stopMotore();
   salvaPosizioneEEPROM();
   registraCicloSeFinecorsa();
-  Serial.print(F("Manuale rilasciato a: "));
-  Serial.println(PercentualeMemo);
 }
 
 void clickBreve(bool su) {
@@ -384,12 +360,10 @@ void clickBreve(bool su) {
     // evita durata = 0: calcola in modo sicuro
     unsigned long diff = (PercentualeTarget > PercentualeMemo) ? (PercentualeTarget - PercentualeMemo) : (PercentualeMemo - PercentualeTarget);
     if (diff == 0) {
-      Serial.println(F("Già alla posizione richiesta"));
       return;
     }
     durata = (unsigned long)tempoTotale * (unsigned long)diff / 100UL;
     startMovimento(su);
-    Serial.println(F("Avvio automatico"));
   } else {
     // stop immediato + calcolo nuova posizione (se era automatico)
     aggiornaPercentuale();
@@ -397,8 +371,6 @@ void clickBreve(bool su) {
     inMovimento = false;
     salvaPosizioneEEPROM();
     registraCicloSeFinecorsa();
-    Serial.print(F("Stop anticipato a: "));
-    Serial.println(PercentualeMemo);
   }
 }
 
@@ -416,8 +388,6 @@ void clickLungo(bool su, unsigned long durataPress) {
   manualHold = false;
   salvaPosizioneEEPROM();
   registraCicloSeFinecorsa();
-  Serial.print(F("Manuale (fallback) rilasciato a: "));
-  Serial.println(PercentualeMemo);
 }
 
 void startMovimento(bool su) {
@@ -484,14 +454,13 @@ uint8_t readMemory(uint8_t fc, uint16_t address, uint16_t length, void* data)
 }
   
 
-// FC01: lettura coils input/allarmi.
-// Nota: i flag allarme vengono azzerati dopo la lettura.
+// FC01: lettura coils input/allarmi (solo lettura, nessun reset implicito).
 uint8_t readDigital(uint8_t fc, uint16_t address, uint16_t length, void* data)
 {
     (void)fc;
     (void)data;
 
-    if (address < 10 || (address + length) > 15) {
+    if (address < 10 || (address + length) > 18) {
       return STATUS_ILLEGAL_DATA_ADDRESS;
     }
 
@@ -503,14 +472,13 @@ uint8_t readDigital(uint8_t fc, uint16_t address, uint16_t length, void* data)
         case 12: coilVal = AllarmeSensoreExt; break;
         case 13: coilVal = AllarmeSensoreInt; break;
         case 14: coilVal = AllarmeTapparella; break;
+        case 15: coilVal = SensoreExtAttivo; break;
+        case 16: coilVal = SensoreIntAttivo; break;
+        case 17: coilVal = RiavvioDaBoot; break;
         default: return STATUS_ILLEGAL_DATA_ADDRESS;
       }
       slave.writeCoilToBuffer(i, coilVal);
     }
-
-    AllarmeSensoreExt = false;
-    AllarmeSensoreInt = false;
-    AllarmeTapparella = false;
     return STATUS_OK;
 }
 
@@ -528,7 +496,9 @@ uint8_t writeDigitalOut(uint8_t fc, uint16_t address, uint16_t length, void* dat
       case 1:
         DisplayAcceso = state;
         oled.ssd1306WriteCmd(state ? SSD1306_DISPLAYON : SSD1306_DISPLAYOFF);
-        Serial.println(state ? F("Display ON") : F("Display OFF"));
+        if (state) {
+          aggiornaDisplay(true);
+        }
         break;
       // Coil 2: comando GIU (true start, false stop)
       case 2:
@@ -579,6 +549,13 @@ uint8_t writeDigitalOut(uint8_t fc, uint16_t address, uint16_t length, void* dat
           }
         }
         break;
+      // Coil 5: reset esplicito allarmi + flag boot (solo su true)
+      case 5:
+        if (state) {
+          resetAllarmi();
+          RiavvioDaBoot = false;
+        }
+        break;
       default:
         return STATUS_ILLEGAL_DATA_ADDRESS;
     }
@@ -598,21 +575,13 @@ uint8_t writeMemory(uint8_t fc, uint16_t address, uint16_t length, void* data)
     if(address == 20){
       // HR20: target posizione tapparella (% 0..100)
       PercentualeModBus = slave.readRegisterFromBuffer(0);
-      Serial.print("Tapparelle: ");
-      Serial.println(PercentualeModBus);
       vaiAPercentuale(PercentualeModBus);
-      Serial.print("tempoTotale: ");
-      Serial.println(tempoTotale);
-      Serial.print("PercentualeMemo: ");
-      Serial.println(PercentualeMemo);
     } else if (address == 21) {
       // HR21: tempoTotale (ms), persistito in EEPROM
       uint16_t nuovoTempo = slave.readRegisterFromBuffer(0);
       if (nuovoTempo >= TEMPO_MIN_MS && nuovoTempo <= TEMPO_MAX_MS) {
         tempoTotale = nuovoTempo;
         salvaTempoTotaleEEPROM();
-        Serial.print(F("Nuovo tempoTotale(ms): "));
-        Serial.println(tempoTotale);
       } else {
         return STATUS_ILLEGAL_DATA_VALUE;
       }
@@ -621,7 +590,6 @@ uint8_t writeMemory(uint8_t fc, uint16_t address, uint16_t length, void* data)
       uint16_t cmd = slave.readRegisterFromBuffer(0);
       if (cmd == 1) {
         resetCicliTapparella();
-        Serial.println(F("Cicli tapparella azzerati"));
       } else {
         return STATUS_ILLEGAL_DATA_VALUE;
       }
@@ -632,8 +600,6 @@ uint8_t writeMemory(uint8_t fc, uint16_t address, uint16_t length, void* data)
         SlaveId = (uint8_t)nuovoSlaveId;
         salvaSlaveIdEEPROM();
         slave.setUnitAddress(SlaveId);
-        Serial.print(F("Nuovo SlaveId: "));
-        Serial.println(SlaveId);
       } else {
         return STATUS_ILLEGAL_DATA_VALUE;
       }
@@ -651,8 +617,6 @@ void vaiAPercentuale(int target) {
 
   // Se già alla posizione richiesta → non fare nulla
   if (PercentualeMemo == target) {
-    Serial.print("Già a: ");
-    Serial.println(target);
     return;
   }
 
@@ -673,9 +637,6 @@ void vaiAPercentuale(int target) {
   bool su = (PercentualeTarget > PercentualeMemo);
   startMovimento(su);
 
-  Serial.print("Avvio movimento verso ");
-  Serial.print(PercentualeTarget);
-  Serial.println("%");
 }
 
 bool coilStateFromData(uint8_t fc, void* data) {
@@ -755,8 +716,20 @@ void resetCicliTapparella() {
   salvaCicliEEPROM();
 }
 
-void aggiornaAllarmeSensore(uint8_t pin, PressTracker& tracker, bool& alarmFlag, const __FlashStringHelper* label) {
-  if (digitalRead(pin) == HIGH) {
+void resetAllarmi() {
+  AllarmeSensoreExt = false;
+  AllarmeSensoreInt = false;
+  AllarmeTapparella = false;
+}
+
+void configuraFontDisplay() {
+  oled.setFont(Verdana12);
+  oled.set2X();
+}
+
+void aggiornaAllarmeSensore(uint8_t pin, PressTracker& tracker, bool& activeFlag, bool& alarmFlag, const __FlashStringHelper* label) {
+  activeFlag = (digitalRead(pin) == HIGH);
+  if (activeFlag) {
     if (!tracker.pressed) {
       tracker.pressed = true;
       tracker.latched = false;
@@ -764,13 +737,81 @@ void aggiornaAllarmeSensore(uint8_t pin, PressTracker& tracker, bool& alarmFlag,
     } else if (!tracker.latched && (millis() - tracker.pressStart >= holdTime)) {
       tracker.latched = true;
       alarmFlag = true;
-      Serial.print(F("Allarme sensore "));
-      Serial.println(label);
     }
   } else {
     tracker.pressed = false;
     tracker.latched = false;
   }
+}
+
+void aggiornaDisplay(bool force) {
+  static bool initialized = false;
+  static int lastTemp = -1000;
+  static int lastHum = -1000;
+  static int lastPos = -1;
+  static bool lastExt = false;
+  static bool lastInt = false;
+  static uint32_t lastCycles = 0xFFFFFFFFUL;
+  static uint8_t lastSlaveId = 0;
+  static unsigned long lastTempoTotale = 0;
+  static bool lastAhtOK = false;
+
+  if (!DisplayAcceso) return;
+
+  int t = (int)Temperature;
+  int h = (int)Humidity;
+  bool changed = force || !initialized ||
+                 t != lastTemp ||
+                 h != lastHum ||
+                 PercentualeMemo != lastPos ||
+                 SensoreExtAttivo != lastExt ||
+                 SensoreIntAttivo != lastInt ||
+                 CicliTapparellaTotali != lastCycles ||
+                 SlaveId != lastSlaveId ||
+                 tempoTotale != lastTempoTotale ||
+                 ahtOK != lastAhtOK;
+
+  if (!changed) return;
+
+  oled.clear();
+  oled.setCursor(2, 0);
+  if (ahtOK) {
+    oled.print(F("T:"));
+    oled.print(t);
+    oled.print(F(" H:"));
+    oled.print(h);
+  } else {
+    oled.print(F("AHT20: NC"));
+  }
+
+  oled.setCursor(0, 3);
+  oled.print(F("EXT:"));
+  oled.print(SensoreExtAttivo ? F("X") : F("O"));
+  oled.print(F("INT:"));
+  oled.print(SensoreIntAttivo ? F("X") : F("O"));
+
+  //oled.setCursor(0, 20);
+  //oled.print(F("P:"));
+  //oled.print(PercentualeMemo);
+  // oled.print(F("% C:"));
+  // oled.print(CicliTapparellaTotali);
+
+  // oled.setCursor(0, 30);
+  // oled.print(F("ID:"));
+  // oled.print(SlaveId);
+  // oled.print(F(" TT:"));
+  // oled.print(tempoTotale);
+
+  initialized = true;
+  lastTemp = t;
+  lastHum = h;
+  lastPos = PercentualeMemo;
+  lastExt = SensoreExtAttivo;
+  lastInt = SensoreIntAttivo;
+  lastCycles = CicliTapparellaTotali;
+  lastSlaveId = SlaveId;
+  lastTempoTotale = tempoTotale;
+  lastAhtOK = ahtOK;
 }
 //
 //extern int __heap_start, *__brkval;
