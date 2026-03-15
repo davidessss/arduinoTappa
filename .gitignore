@@ -1,0 +1,10 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Build
+libdeps/
+
+# OS
+.DS_Store
+Thumbs.db
