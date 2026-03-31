@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 #include <ModbusSlave.h>
 #include <AHT10.h>
 #include <Wire.h>
@@ -34,9 +33,9 @@
 #define DEFAULT_SLAVE_ID 2
 
 #define SERIAL_BAUDRATE 9600
-#define SERIAL_PORT RS485
-#define rxPin 9
-#define txPin 8
+#define SERIAL_PORT Serial
+#define LED_CTRL 10
+#define MODBUS_LED_PULSE_MS 80UL
 #define I2C_ADDRESS 0x3C
 #define period 5000
 #define RST_PIN -1
@@ -103,11 +102,12 @@ struct PressTracker {
 PressTracker sensoreExtTracker;
 PressTracker sensoreIntTracker;
 
+unsigned long modbusLedUntil = 0;
+uint64_t lastModbusBytesReceived = 0;
 
 SSD1306AsciiAvrI2c oled;
 AHT10 myAHT20(AHT10_ADDRESS_0X38, AHT20_SENSOR);
-SoftwareSerial RS485 (rxPin, txPin);
-Modbus slave(RS485, DEFAULT_SLAVE_ID, MODBUS_CONTROL_PIN_NONE);
+Modbus slave(SERIAL_PORT, DEFAULT_SLAVE_ID, MODBUS_CONTROL_PIN_NONE);
 
 uint8_t readDigital(uint8_t fc, uint16_t address, uint16_t length, void* data);
 uint8_t readMemory(uint8_t fc, uint16_t address, uint16_t length, void* data);
@@ -137,11 +137,10 @@ void configuraFontDisplay();
 bool coilStateFromData(uint8_t fc, void* data);
 void aggiornaAllarmeSensore(uint8_t pin, PressTracker& tracker, bool& activeFlag, bool& alarmFlag, const __FlashStringHelper* label);
 void aggiornaDisplay(bool force);
+void aggiornaLedTrafficoModbus();
 
 
 void setup() {
-  pinMode(rxPin, INPUT);
-  pinMode(txPin, OUTPUT);
   pinMode(PulsanteSU, INPUT_PULLUP);
   pinMode(PulsanteGIU, INPUT_PULLUP);
   pinMode(FINESTRA, INPUT);
@@ -151,11 +150,13 @@ void setup() {
   pinMode(BEEP, OUTPUT);
   pinMode(SENSOREEXT, INPUT);
   pinMode(SENSOREINT, INPUT);
+  pinMode(LED_CTRL, OUTPUT);
+  digitalWrite(LED_CTRL, LOW);
   digitalWrite(ReleSU, LOW);
   digitalWrite(ReleGIU, LOW);
   // Carica i parametri persistiti prima di inizializzare lo stack Modbus.
   caricaConfigEEPROM();
-  RS485.begin(SERIAL_BAUDRATE);
+  SERIAL_PORT.begin(SERIAL_BAUDRATE);
     slave.cbVector[CB_READ_COILS] = readDigital;
     slave.cbVector[CB_READ_HOLDING_REGISTERS] = readMemory;
     slave.cbVector[CB_WRITE_COILS] = writeDigitalOut;
@@ -163,6 +164,7 @@ void setup() {
 
     slave.setUnitAddress(SlaveId);
     slave.begin(SERIAL_BAUDRATE);
+    lastModbusBytesReceived = slave.getTotalBytesReceived();
     for (int i = 0; i < 5; i++) {
         if (myAHT20.begin()) {
             ahtOK = true;
@@ -197,8 +199,8 @@ void setup() {
 }
 
 void loop() {
-
-    slave.poll(); 
+    slave.poll();
+    aggiornaLedTrafficoModbus();
     Sensore();
     ControlloCicliTapparella();
 //
@@ -237,6 +239,18 @@ void loop() {
       registraCicloSeFinecorsa();
     }
   }
+}
+
+void aggiornaLedTrafficoModbus() {
+  uint64_t bytesReceived = slave.getTotalBytesReceived();
+  unsigned long now = millis();
+
+  if (bytesReceived != lastModbusBytesReceived) {
+    lastModbusBytesReceived = bytesReceived;
+    modbusLedUntil = now + MODBUS_LED_PULSE_MS;
+  }
+
+  digitalWrite(LED_CTRL, now < modbusLedUntil ? HIGH : LOW);
 }
 
 void ControlloCicliTapparella(void) {
